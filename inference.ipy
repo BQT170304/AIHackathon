@@ -1,0 +1,76 @@
+import cv2
+import os
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
+from ultralytics import YOLO
+
+image_size = 224
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+transform = transforms.Compose([transforms.Resize((image_size, image_size)),
+                                transforms.ToTensor(),
+                                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                        std = [0.225, 0.225, 0.225])])
+race_dict = {0:'Caucasian', 1:'Mongoloid', 2:'Negroid'}
+skin_dict = {0:'dark', 1:'mid-dark', 2:'light', 3:'mid-light'}
+age_dict = {0:'20-30s', 1:'40-50s', 2:'Baby', 3:'Kid', 4:'Senior', 5:'Teenager'}
+emotion_dict = {
+        0: 'Happiness',
+        1: 'Neutral',
+        2: 'Surprise',
+        3: 'Sadness',
+        4: 'Anger',
+        5: 'Disgust',
+        6: 'Fear'
+    }
+
+class MainModel(nn.Module):
+    def __init__(self, nrace=3, nskin=4):
+        super().__init__()
+        
+        self.backbone = torch.load('./backbone.pt')
+        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(output_size=(7, 7)),
+                                  nn.Flatten())
+        self.fc = nn.Sequential(
+                                nn.Linear(in_features=25088, out_features=4096, bias=True),
+                                nn.ReLU(inplace=True),
+                                nn.Dropout())
+        self.fc.load_state_dict(torch.load('./fc.pth'))
+        self.race = nn.Linear(in_features=4096, out_features=nrace, bias=False)
+        self.race.load_state_dict(torch.load('./race.pth'))
+        self.skin = nn.Linear(in_features=4096, out_features=nskin, bias=False) 
+        self.skin.load_state_dict(torch.load('./skin.pth'))
+        self.mask = torch.load('./masked.pt')
+        self.gender = torch.load('./gender.pt')
+        self.age = nn.Linear(in_features=4096, out_features=6, bias=False)
+        self.age.load_state_dict(torch.load('./age.pth'))
+        self.emotion = nn.Linear(in_features=4096, out_features=7, bias=False)
+        self.emotion.load_state_dict(torch.load('./emotion.pth'))
+    
+    def forward(self, x):
+        out = self.pool(self.backbone(x))
+        return self.race(self.fc(out)), self.age(self.fc(out)), self.emotion(self.fc(out)), self.gender(out),  \
+                self.skin(self.fc(out)), self.mask(out)
+
+def predict(model, yolo, image_path):
+    res = yolo(image_path)
+    box = res[0].boxes[0].xyxy.cpu().numpy()[0]
+    img = cv2.imread(image_path)
+    x1,y1,x2,y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+    crop_img = img[y1:y2, x1:x2, :]
+    input = transform(Image.fromarray(crop_img))
+    out = model(input.unsqueeze(0).to(device))
+    race = race_dict[torch.argmax(out[0]).item()]
+    age = age_dict[torch.argmax(out[1]).item()]
+    emotion = emotion_dict[torch.argmax(out[2]).item()]
+    gender = 'Female' if torch.sigmoid(out[3]) < 0.5 else 'Male'
+    skintone = skin_dict[torch.argmax(out[4]).item()]
+    masked = 'Unmasked' if torch.sigmoid(out[5]) < 0.5 else 'Masked'
+    return race, age, emotion, gender, skintone, masked
+    
+model = MainModel().to(device)
+yolo = YOLO('./best.pt').to(device)
+res = predict(model, yolo, image_path='./100104600.jpg')
+for ele in res:
+    print(ele)
